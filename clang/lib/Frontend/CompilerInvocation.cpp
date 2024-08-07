@@ -33,6 +33,7 @@
 #include "clang/Driver/DriverDiagnostic.h"
 #include "clang/Driver/Options.h"
 #include "clang/Frontend/CommandLineSourceLoc.h"
+#include "clang/Frontend/CompileJobCacheResult.h"
 #include "clang/Frontend/DependencyOutputOptions.h"
 #include "clang/Frontend/FrontendDiagnostic.h"
 #include "clang/Frontend/FrontendOptions.h"
@@ -58,6 +59,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/CAS/ActionCache.h"
 #include "llvm/CAS/CASFileSystem.h"
 #include "llvm/CAS/ObjectStore.h"
 #include "llvm/CAS/TreeSchema.h"
@@ -3074,7 +3076,7 @@ static void GenerateFrontendArgs(const FrontendOptions &Opts,
 
   // OPT_INPUT has a unique class, generate it directly.
   for (const auto &Input : Opts.Inputs)
-    if (!Input.isIncludeTree())
+    if (!Input.isIncludeTree() && !Input.isBuffer())
       Consumer(Input.getFile());
 }
 
@@ -3120,6 +3122,48 @@ static void determineInputFromIncludeTree(
   if (!Contents)
     return reportError(Contents.takeError());
   Buffer = llvm::MemoryBufferRef(Contents->getData(), InputFilename);
+}
+
+static llvm::Error
+determineInputFromCacheKey(StringRef CacheKey, CASOptions &CASOpts,
+                           DiagnosticsEngine &Diags,
+                           std::optional<llvm::MemoryBufferRef> &Buffer) {
+  assert(!CacheKey.empty());
+
+  std::shared_ptr<cas::ObjectStore> CAS;
+  std::shared_ptr<cas::ActionCache> Cache;
+  std::tie(CAS, Cache) = CASOpts.getOrCreateDatabases(Diags);
+  if (!CAS || !Cache)
+    return llvm::createStringError("unable to initialize CAS");
+
+  auto ID = CAS->parseID(CacheKey);
+  if (!ID)
+    return ID.takeError();
+
+  auto Value = Cache->get(*ID);
+  if (!Value)
+    return Value.takeError();
+  if (!*Value)
+    return llvm::cas::ObjectStore::createUnknownObjectError(*ID);
+  auto ValueRef = CAS->getReference(**Value);
+  if (!ValueRef)
+    return llvm::cas::ObjectStore::createUnknownObjectError(**Value);
+
+  cas::CompileJobResultSchema Schema(*CAS);
+  auto Result = Schema.load(*ValueRef);
+  if (!Result)
+    return Result.takeError();
+  auto Output =
+      Result->getOutput(cas::CompileJobCacheResult::OutputKind::MainOutput);
+  if (!Output)
+    return llvm::createStringError("unable to get the main compilation output");
+
+  auto OutProxy = CAS->getProxy(Output->Object);
+  if (!OutProxy)
+    return OutProxy.takeError();
+
+  Buffer = llvm::MemoryBufferRef(OutProxy->getData(), "<input>");
+  return llvm::Error::success();
 }
 
 static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
@@ -3380,6 +3424,12 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
       Inputs.push_back(InputFilename.str());
   }
 
+  if (!Opts.CASInputFileCacheKey.empty()) {
+    if (!Inputs.empty())
+      Diags.Report(diag::err_drv_inputs_and_include_tree);
+    Inputs.push_back("<input>");
+  }
+
   if (Inputs.empty())
     Inputs.push_back("-");
 
@@ -3423,6 +3473,22 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
     } else {
       InputFile = FrontendInputFile(Tree->getRef(), InputFile.getFile(),
                                     InputFile.getKind(), InputFile.isSystem());
+    }
+  }
+
+  if (!Opts.CASInputFileCacheKey.empty()) {
+    std::optional<llvm::MemoryBufferRef> Buff;
+    if (llvm::Error E = determineInputFromCacheKey(Opts.CASInputFileCacheKey,
+                                                   CASOpts, Diags, Buff)) {
+      Diags.Report(diag::err_fe_unable_to_load_input_cache_key)
+          << Opts.CASInputFileCacheKey << llvm::toString(std::move(E));
+    } else {
+      Inputs.push_back(Buff->getBufferIdentifier().str());
+
+      FrontendInputFile &InputFile = Opts.Inputs.back();
+
+      InputFile =
+          FrontendInputFile(*Buff, InputFile.getKind(), InputFile.isSystem());
     }
   }
 
